@@ -162,14 +162,38 @@ uninstall_self() {
 }
 
 case "$1" in
-  tunnel-up) tunnel_up ;;
-  tunnel-down) tunnel_down ;;
-  restart) restart_tunnel ;;
-  route-on) route_on ;;
-  route-off) route_off ;;
-  restore) restore ;;
-  status) status ;;
-  uninstall) uninstall_self ;;
+  tunnel-up)
+    tunnel_up
+    ;;
+
+  tunnel-down)
+    tunnel_down
+    ;;
+
+  restart)
+    restart_tunnel
+    ;;
+
+  route-on)
+    route_on
+    ;;
+
+  route-off)
+    route_off
+    ;;
+
+  restore)
+    restore
+    ;;
+
+  status)
+    status
+    ;;
+
+  uninstall)
+    uninstall_self
+    ;;
+
   *)
     echo "Usage:"
     echo "  wg-relay tunnel-up"
@@ -213,6 +237,40 @@ def run(cmd):
 def auth_ok():
     return request.args.get("key") == WEB_PASSWORD or request.form.get("key") == WEB_PASSWORD
 
+def normalize_wireguard_config(content):
+    lines = content.splitlines()
+    result = []
+    in_interface = False
+    table_found = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped == "[Interface]":
+            in_interface = True
+            table_found = False
+            result.append(line)
+            continue
+
+        if stripped.startswith("[Peer]"):
+            if in_interface and not table_found:
+                result.append("Table = off")
+            in_interface = False
+            result.append(line)
+            continue
+
+        if in_interface and stripped.lower().startswith("table"):
+            result.append("Table = off")
+            table_found = True
+            continue
+
+        result.append(line)
+
+    if in_interface and not table_found:
+        result.append("Table = off")
+
+    return "\\n".join(result) + "\\n"
+
 LOGIN = """
 <!doctype html>
 <html>
@@ -254,6 +312,7 @@ input[type=file]{background:#020617;padding:12px;border-radius:12px;width:100%;m
 pre{background:#020617;padding:14px;border-radius:12px;overflow:auto;white-space:pre-wrap}
 .badge{display:inline-block;padding:6px 10px;border-radius:999px;background:#020617;color:#94a3b8;margin-top:6px}
 .footer{text-align:center;color:#64748b;margin-top:22px}
+.note{color:#94a3b8;font-size:14px;line-height:1.6}
 </style>
 </head>
 <body>
@@ -264,6 +323,7 @@ pre{background:#020617;padding:14px;border-radius:12px;overflow:auto;white-space
 <h3>Exit Tunnel Config</h3>
 <div class="badge">Interface: {{ exit_if }}</div>
 <div class="badge">Client subnet: {{ client_subnet }}</div>
+<p class="note">Upload the WireGuard client config exported from the exit node. The system will automatically add <b>Table = off</b> to avoid breaking the relay server default route.</p>
 <form method="post" action="/upload?key={{ key }}" enctype="multipart/form-data">
 <input type="file" name="config" required>
 <button class="blue">Upload wg-exit.conf</button>
@@ -281,7 +341,7 @@ pre{background:#020617;padding:14px;border-radius:12px;overflow:auto;white-space
 
 <div class="card">
 <h3>Route Control</h3>
-<p>Enable route = all WireGuard Easy clients in the subnet will exit through the remote node.</p>
+<p class="note">Enable route = all WireGuard Easy clients in the configured subnet will exit through the remote node.</p>
 <div class="row">
 <form method="post" action="/action/route-on?key={{ key }}"><button class="green">Enable Route</button></form>
 <form method="post" action="/action/route-off?key={{ key }}"><button class="red">Disable Route</button></form>
@@ -295,13 +355,6 @@ pre{background:#020617;padding:14px;border-radius:12px;overflow:auto;white-space
 <button class="gray">Refresh</button>
 </form>
 <pre>{{ status }}</pre>
-</div>
-
-<div class="card">
-<h3>Danger Zone</h3>
-<form method="post" action="/action/uninstall?key={{ key }}" onsubmit="return confirm('Uninstall WG Relay Manager?')">
-<button class="red">Uninstall</button>
-</form>
 </div>
 
 <div class="footer">Powered by Đại An VPN</div>
@@ -331,9 +384,16 @@ def upload():
     f = request.files.get("config")
     if not f:
         return "No file", 400
+
+    raw = f.read().decode("utf-8", errors="ignore")
+    normalized = normalize_wireguard_config(raw)
+
     path = os.path.join(APP_DIR, f"{EXIT_IF}.conf")
-    f.save(path)
+    with open(path, "w") as out:
+        out.write(normalized)
+
     os.chmod(path, 0o600)
+
     return redirect("/?key=" + WEB_PASSWORD)
 
 @app.route("/action/<action>", methods=["POST"])
@@ -343,14 +403,13 @@ def action(action):
         "tunnel-down",
         "restart",
         "route-on",
-        "route-off",
-        "uninstall"
+        "route-off"
     }
+
     if action not in allowed:
         return "Invalid action", 400
+
     run(f"wg-relay {action}")
-    if action == "uninstall":
-        return "Uninstalled"
     return redirect("/?key=" + WEB_PASSWORD)
 
 if __name__ == "__main__":
