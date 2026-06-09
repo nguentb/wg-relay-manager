@@ -6,6 +6,7 @@ BIN="/usr/local/bin/wg-relay"
 
 WEB_PORT="${WEB_PORT:-8090}"
 WEB_PASSWORD="${WEB_PASSWORD:-admin123}"
+CONTAINER="${CONTAINER:-wg-easy}"
 CLIENT_SUBNET="${CLIENT_SUBNET:-10.8.0.0/24}"
 EXIT_IF="${EXIT_IF:-wg-exit}"
 ROUTE_TABLE="${ROUTE_TABLE:-200}"
@@ -18,6 +19,7 @@ mkdir -p "$APP_DIR"
 cat > "$APP_DIR/config" <<CONFIGEOF
 WEB_PORT="$WEB_PORT"
 WEB_PASSWORD="$WEB_PASSWORD"
+CONTAINER="$CONTAINER"
 CLIENT_SUBNET="$CLIENT_SUBNET"
 EXIT_IF="$EXIT_IF"
 ROUTE_TABLE="$ROUTE_TABLE"
@@ -32,17 +34,27 @@ CONFIG_FILE="/opt/wg-relay-manager/config"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 APP_DIR="${APP_DIR:-/opt/wg-relay-manager}"
+CONTAINER="${CONTAINER:-wg-easy}"
 EXIT_IF="${EXIT_IF:-wg-exit}"
 CLIENT_SUBNET="${CLIENT_SUBNET:-10.8.0.0/24}"
 ROUTE_TABLE="${ROUTE_TABLE:-200}"
 
 LOCAL_CONF="$APP_DIR/$EXIT_IF.conf"
-WG_CONF="/etc/wireguard/$EXIT_IF.conf"
+HOST_WG_CONF="/etc/wireguard/$EXIT_IF.conf"
+CT_WG_CONF="/etc/wireguard/$EXIT_IF.conf"
 ROUTE_FLAG="$APP_DIR/route.enabled"
 
-ensure_forward() {
+run_ct() {
+  docker exec "$CONTAINER" sh -c "$1"
+}
+
+ensure_forward_host() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wg-relay.conf
+}
+
+ensure_forward_container() {
+  run_ct "sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true"
 }
 
 install_conf() {
@@ -51,50 +63,74 @@ install_conf() {
     exit 1
   fi
 
-  cp "$LOCAL_CONF" "$WG_CONF"
-  chmod 600 "$WG_CONF"
+  mkdir -p /etc/wireguard
+  cp "$LOCAL_CONF" "$HOST_WG_CONF"
+  chmod 600 "$HOST_WG_CONF"
+
+  docker cp "$HOST_WG_CONF" "$CONTAINER:$CT_WG_CONF"
+  run_ct "chmod 600 '$CT_WG_CONF'"
 }
 
 tunnel_up() {
   install_conf
-  wg-quick down "$EXIT_IF" 2>/dev/null || true
-  wg-quick up "$EXIT_IF"
-  echo "Tunnel started: $EXIT_IF"
+
+  run_ct "wg-quick down '$EXIT_IF' 2>/dev/null || true"
+  run_ct "wg-quick up '$EXIT_IF'"
+
+  echo "Tunnel started inside container: $EXIT_IF"
 }
 
 tunnel_down() {
-  wg-quick down "$EXIT_IF" 2>/dev/null || true
-  echo "Tunnel stopped: $EXIT_IF"
+  run_ct "wg-quick down '$EXIT_IF' 2>/dev/null || true"
+  echo "Tunnel stopped inside container: $EXIT_IF"
 }
 
 route_off() {
-  while ip rule del from "$CLIENT_SUBNET" table "$ROUTE_TABLE" 2>/dev/null; do :; done
-  ip route flush table "$ROUTE_TABLE" 2>/dev/null || true
+  run_ct "
+while ip rule del from '$CLIENT_SUBNET' table '$ROUTE_TABLE' 2>/dev/null; do :; done
+ip route flush table '$ROUTE_TABLE' 2>/dev/null || true
 
-  while iptables -t nat -D POSTROUTING -s "$CLIENT_SUBNET" -o "$EXIT_IF" -j MASQUERADE 2>/dev/null; do :; done
+while iptables -t nat -D POSTROUTING -s '$CLIENT_SUBNET' -o '$EXIT_IF' -j MASQUERADE 2>/dev/null; do :; done
+
+while iptables -D FORWARD -j WG_RELAY 2>/dev/null; do :; done
+iptables -F WG_RELAY 2>/dev/null || true
+iptables -X WG_RELAY 2>/dev/null || true
+" || true
 
   rm -f "$ROUTE_FLAG"
-  echo "Route disabled"
+  echo "Route disabled inside container"
 }
 
 route_on() {
-  ensure_forward
+  ensure_forward_host
+  ensure_forward_container
 
-  ip link show "$EXIT_IF" >/dev/null 2>&1 || tunnel_up
+  run_ct "ip link show '$EXIT_IF' >/dev/null 2>&1" || tunnel_up
 
   route_off >/dev/null 2>&1 || true
 
-  ip route add default dev "$EXIT_IF" table "$ROUTE_TABLE"
-  ip rule add from "$CLIENT_SUBNET" table "$ROUTE_TABLE"
-  iptables -t nat -A POSTROUTING -s "$CLIENT_SUBNET" -o "$EXIT_IF" -j MASQUERADE
+  run_ct "
+iptables -N WG_RELAY 2>/dev/null || true
+iptables -F WG_RELAY
+
+iptables -C FORWARD -j WG_RELAY 2>/dev/null || iptables -A FORWARD -j WG_RELAY
+
+iptables -A WG_RELAY -s '$CLIENT_SUBNET' -o '$EXIT_IF' -j ACCEPT
+
+ip route add default dev '$EXIT_IF' table '$ROUTE_TABLE'
+ip rule add from '$CLIENT_SUBNET' table '$ROUTE_TABLE'
+
+iptables -t nat -A POSTROUTING -s '$CLIENT_SUBNET' -o '$EXIT_IF' -j MASQUERADE
+"
 
   touch "$ROUTE_FLAG"
-  echo "Route enabled"
+  echo "Route enabled inside container"
 }
 
 restart_tunnel() {
   tunnel_down
   tunnel_up
+
   if [ -f "$ROUTE_FLAG" ]; then
     route_on
   fi
@@ -109,34 +145,43 @@ restore() {
 
 status() {
   echo "=== Config ==="
+  echo "Container: $CONTAINER"
   echo "Exit interface: $EXIT_IF"
   echo "Client subnet: $CLIENT_SUBNET"
   echo "Route table: $ROUTE_TABLE"
   echo
 
-  echo "=== Tunnel ==="
-  if ip link show "$EXIT_IF" >/dev/null 2>&1; then
+  echo "=== Tunnel inside container ==="
+  if docker exec "$CONTAINER" ip link show "$EXIT_IF" >/dev/null 2>&1; then
     echo "Tunnel: UP"
-    wg show "$EXIT_IF" 2>/dev/null || true
+    docker exec "$CONTAINER" wg show "$EXIT_IF" 2>/dev/null || true
   else
     echo "Tunnel: DOWN"
   fi
 
   echo
-  echo "=== Route ==="
-  if ip rule show | grep -q "from $CLIENT_SUBNET lookup $ROUTE_TABLE"; then
+  echo "=== Route inside container ==="
+  if docker exec "$CONTAINER" ip rule show | grep -q "from $CLIENT_SUBNET lookup $ROUTE_TABLE"; then
     echo "Route: ENABLED"
   else
     echo "Route: DISABLED"
   fi
 
   echo
-  echo "=== Route table $ROUTE_TABLE ==="
-  ip route show table "$ROUTE_TABLE" 2>/dev/null || true
+  echo "=== Route table $ROUTE_TABLE inside container ==="
+  docker exec "$CONTAINER" ip route show table "$ROUTE_TABLE" 2>/dev/null || true
 
   echo
-  echo "=== NAT ==="
-  iptables -t nat -S POSTROUTING | grep "$EXIT_IF" || true
+  echo "=== NAT inside container ==="
+  docker exec "$CONTAINER" iptables -t nat -S POSTROUTING | grep "$EXIT_IF" || true
+
+  echo
+  echo "=== Captive check ==="
+  docker exec "$CONTAINER" iptables -S WG_EXPIRED 2>/dev/null || echo "WG Captive not detected"
+
+  echo
+  echo "=== Relay chain ==="
+  docker exec "$CONTAINER" iptables -S WG_RELAY 2>/dev/null || true
 }
 
 uninstall_self() {
@@ -153,7 +198,9 @@ uninstall_self() {
 
   systemctl daemon-reload
 
-  rm -f "$WG_CONF"
+  rm -f "$HOST_WG_CONF"
+  docker exec "$CONTAINER" rm -f "$CT_WG_CONF" 2>/dev/null || true
+
   rm -f /etc/sysctl.d/99-wg-relay.conf
   rm -f /usr/local/bin/wg-relay
   rm -rf "$APP_DIR"
@@ -227,6 +274,7 @@ WEB_PORT = int(CONFIG.get("WEB_PORT", "8090"))
 APP_DIR = CONFIG.get("APP_DIR", "/opt/wg-relay-manager")
 EXIT_IF = CONFIG.get("EXIT_IF", "wg-exit")
 CLIENT_SUBNET = CONFIG.get("CLIENT_SUBNET", "10.8.0.0/24")
+CONTAINER = CONFIG.get("CONTAINER", "wg-easy")
 
 app = Flask(__name__)
 
@@ -238,6 +286,13 @@ def auth_ok():
     return request.args.get("key") == WEB_PASSWORD or request.form.get("key") == WEB_PASSWORD
 
 def normalize_wireguard_config(content):
+    content = content.strip()
+
+    if "\\n" in content:
+        content = content.replace("\\r\\n", "\n")
+        content = content.replace("\\n", "\n")
+        content = content.replace("\\t", "\t")
+
     lines = content.splitlines()
     result = []
     in_interface = False
@@ -269,7 +324,7 @@ def normalize_wireguard_config(content):
     if in_interface and not table_found:
         result.append("Table = off")
 
-    return "\\n".join(result) + "\\n"
+    return "\n".join(result) + "\n"
 
 def get_exit_info():
     path = os.path.join(APP_DIR, f"{EXIT_IF}.conf")
@@ -376,9 +431,10 @@ pre{background:#020617;padding:14px;border-radius:12px;overflow:auto;white-space
 
 <div class="card">
 <h3>Exit Tunnel Config</h3>
+<div class="badge">Container: {{ container }}</div>
 <div class="badge">Interface: {{ exit_if }}</div>
 <div class="badge">Client subnet: {{ client_subnet }}</div>
-<p class="note">Upload the WireGuard client config exported from the exit node. The system will automatically add <b>Table = off</b> to avoid changing the relay server default route.</p>
+<p class="note">Upload the WireGuard client config exported from the exit node. The system automatically adds <b>Table = off</b> and runs the tunnel inside the WG Easy container.</p>
 <form method="post" action="/upload?key={{ key }}" enctype="multipart/form-data">
 <input type="file" name="config" required>
 <button class="blue">Upload wg-exit.conf</button>
@@ -412,7 +468,7 @@ PublicKey: {{ exit_info.public_key }}</pre>
 
 <div class="card">
 <h3>Route Control</h3>
-<p class="note">Enable route = all WireGuard Easy clients in the configured subnet will exit through the remote node.</p>
+<p class="note">Enable route = all non-blocked WireGuard Easy clients in the configured subnet will exit through the remote node. Existing wg-captive blocked users are still handled first.</p>
 <div class="row">
 <form method="post" action="/action/route-on?key={{ key }}"><button class="green">Enable Route</button></form>
 <form method="post" action="/action/route-off?key={{ key }}"><button class="red">Disable Route</button></form>
@@ -450,6 +506,7 @@ def index():
         status=status,
         exit_if=EXIT_IF,
         client_subnet=CLIENT_SUBNET,
+        container=CONTAINER,
         exit_info=exit_info
     )
 
@@ -493,7 +550,8 @@ PYEOF
 cat > /etc/systemd/system/wg-relay-web.service <<EOF
 [Unit]
 Description=WG Relay Manager Web UI
-After=network.target
+After=network.target docker.service
+Requires=docker.service
 
 [Service]
 ExecStart=/usr/bin/python3 $APP_DIR/app.py
@@ -505,9 +563,10 @@ EOF
 
 cat > /etc/systemd/system/wg-relay-restore.service <<EOF
 [Unit]
-Description=Restore WG Relay Route
-After=network-online.target
+Description=Restore WG Relay Route Inside Container
+After=network-online.target docker.service
 Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=oneshot
