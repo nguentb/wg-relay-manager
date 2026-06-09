@@ -271,6 +271,61 @@ def normalize_wireguard_config(content):
 
     return "\\n".join(result) + "\\n"
 
+def get_exit_info():
+    path = os.path.join(APP_DIR, f"{EXIT_IF}.conf")
+
+    info = {
+        "uploaded": False,
+        "address": "-",
+        "dns": "-",
+        "table": "-",
+        "endpoint": "-",
+        "public_key": "-",
+        "allowed_ips": "-"
+    }
+
+    if not os.path.exists(path):
+        return info
+
+    info["uploaded"] = True
+    section = None
+
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+
+            if line == "[Interface]":
+                section = "interface"
+                continue
+
+            if line == "[Peer]":
+                section = "peer"
+                continue
+
+            if "=" not in line:
+                continue
+
+            key, value = [x.strip() for x in line.split("=", 1)]
+            key_lower = key.lower()
+
+            if section == "interface":
+                if key_lower == "address":
+                    info["address"] = value
+                elif key_lower == "dns":
+                    info["dns"] = value
+                elif key_lower == "table":
+                    info["table"] = value
+
+            if section == "peer":
+                if key_lower == "endpoint":
+                    info["endpoint"] = value
+                elif key_lower == "publickey":
+                    info["public_key"] = value
+                elif key_lower == "allowedips":
+                    info["allowed_ips"] = value
+
+    return info
+
 LOGIN = """
 <!doctype html>
 <html>
@@ -323,11 +378,27 @@ pre{background:#020617;padding:14px;border-radius:12px;overflow:auto;white-space
 <h3>Exit Tunnel Config</h3>
 <div class="badge">Interface: {{ exit_if }}</div>
 <div class="badge">Client subnet: {{ client_subnet }}</div>
-<p class="note">Upload the WireGuard client config exported from the exit node. The system will automatically add <b>Table = off</b> to avoid breaking the relay server default route.</p>
+<p class="note">Upload the WireGuard client config exported from the exit node. The system will automatically add <b>Table = off</b> to avoid changing the relay server default route.</p>
 <form method="post" action="/upload?key={{ key }}" enctype="multipart/form-data">
 <input type="file" name="config" required>
 <button class="blue">Upload wg-exit.conf</button>
 </form>
+</div>
+
+<div class="card">
+<h3>Exit Node Info</h3>
+{% if exit_info.uploaded %}
+<div class="badge">Config: Uploaded</div>
+<pre>Address: {{ exit_info.address }}
+DNS: {{ exit_info.dns }}
+Table: {{ exit_info.table }}
+Endpoint: {{ exit_info.endpoint }}
+AllowedIPs: {{ exit_info.allowed_ips }}
+PublicKey: {{ exit_info.public_key }}</pre>
+{% else %}
+<div class="badge">Config: Not uploaded</div>
+<p class="note">Upload a wg-exit.conf file to view exit node information.</p>
+{% endif %}
 </div>
 
 <div class="card">
@@ -371,12 +442,15 @@ def auth():
 @app.route("/")
 def index():
     status = run("wg-relay status")
+    exit_info = get_exit_info()
+
     return render_template_string(
         HTML,
         key=WEB_PASSWORD,
         status=status,
         exit_if=EXIT_IF,
-        client_subnet=CLIENT_SUBNET
+        client_subnet=CLIENT_SUBNET,
+        exit_info=exit_info
     )
 
 @app.route("/upload", methods=["POST"])
